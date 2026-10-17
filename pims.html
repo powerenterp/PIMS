@@ -5378,6 +5378,7 @@ async function submitAuth(){
       }catch(_e){}
       // Feature 2: Force password change if sys-owner reset it
       if(entry.role==='owner'&&_checkForcePassReset(u,entry.ownerId||u,entry.role||'user'))return;
+      try{window.pimsProvision&&window.pimsProvision(u,p);}catch(_e){}
       await doLogin(u,entry.ownerId||u,entry.role||'user');
     }else{
       const c=cap(document.getElementById('auth-confirm').value,MAX_PASSWORD_LEN);
@@ -16302,6 +16303,22 @@ html[data-theme="dark"] .drawer-logout-btn{color:#fb7185}
 var noop=function(){};
 var isHttp=/^https?:$/.test(location.protocol);
 var uid=0;
+
+/* ═════════ 0. Stage 1: quietly create each user's Supabase login (nothing visible changes) ═════════ */
+window.pimsProvision=function(u,p){
+  try{
+    if(typeof SUPABASE_URL==='undefined'||typeof SUPABASE_KEY==='undefined')return;
+    var key='pims_prov_'+u,last=0;
+    try{last=parseInt(localStorage.getItem(key)||'0',10)||0;}catch(_){}
+    if(Date.now()-last<24*3600*1000)return;                       // at most once a day per user per device
+    var ctrl=new AbortController(),t=setTimeout(function(){ctrl.abort();},8000);
+    fetch(SUPABASE_URL+'/functions/v1/ims-login',{method:'POST',signal:ctrl.signal,
+      headers:{'Content-Type':'application/json','apikey':SUPABASE_KEY},
+      body:JSON.stringify({username:u,password:p})})
+    .then(function(r){clearTimeout(t);if(r.ok){try{localStorage.setItem(key,String(Date.now()));}catch(_){}}})
+    .catch(noop);                                                  // function not deployed / offline: ignore
+  }catch(e){}
+};
 
 /* ═════════ 1. PWA: manifest, service worker, install button ═════════ */
 var deferredInstall=null;
