@@ -4988,46 +4988,93 @@ let _syncT=null;
 let _lastWrittenAt='';
 
 function _createSupabaseCompat(client){
+  // Stage 2: the five shared documents go through the ims-gate server function (rules enforced on the server).
+  // Everything else (each shop's own record) still goes straight to the database, protected by row-level security.
+  const SPECIAL={_global_registry:1,_pending_owners:1,_sub_requests:1,_reset_requests:1,_banned_owners:1};
+  const snap=d=>({exists:!!d,data(){return d||null;}});
+  function directDoc(table,id){
+    return{
+      async get(){
+        const{data,error}=await client.from(table).select('data').eq('id',id).maybeSingle();
+        if(error)throw error;
+        return{exists:!!data,data(){return data?data.data:null;}};
+      },
+      async set(updates,options){
+        if(options&&options.merge){
+          const{data:existing}=await client.from(table).select('data').eq('id',id).maybeSingle();
+          const merged=Object.assign({},existing?existing.data:{},updates);
+          const{error}=await client.from(table).upsert({id,data:merged},{onConflict:'id'});
+          if(error)throw error;
+        }else{
+          const{error}=await client.from(table).upsert({id,data:updates},{onConflict:'id'});
+          if(error)throw error;
+        }
+      },
+      async delete(){
+        const{error}=await client.from(table).delete().eq('id',id);
+        if(error)throw error;
+      },
+      onSnapshot(callback,errCallback){
+        client.from(table).select('data').eq('id',id).maybeSingle()
+          .then(({data,error})=>{
+            if(error){if(errCallback)errCallback(error);return;}
+            callback({exists:!!data,data(){return data?data.data:null;}});
+          }).catch(err=>{if(errCallback)errCallback(err);});
+        const channel=client.channel(`${table}:${id}`)
+          .on('postgres_changes',{event:'*',schema:'public',table,filter:`id=eq.${id}`},payload=>{
+            const row=payload.new;
+            callback({exists:!!row&&Object.keys(row).length>0,data(){return row&&row.data?row.data:null;}});
+          })
+          .subscribe(status=>{
+            if(status==='CHANNEL_ERROR'&&errCallback)errCallback(new Error('Realtime channel error'));
+          });
+        return()=>client.removeChannel(channel);
+      }
+    };
+  }
   return{
     collection(table){
       return{
         doc(id){
+          const direct=directDoc(table,id);
+          if(!SPECIAL[id]||table!=='power_ims5')return direct;
+          const viaGate=()=>typeof window.pimsGate==='function';
+          const useDirect=r=>r.unavailable||r.authRequired;     // gate not deployed / not signed in yet -> old behaviour
           return{
             async get(){
-              const{data,error}=await client.from(table).select('data').eq('id',id).maybeSingle();
-              if(error)throw error;
-              return{exists:!!data,data(){return data?data.data:null;}};
+              if(!viaGate())return direct.get();
+              const r=await window.pimsGate('get',{doc:id});
+              if(useDirect(r))return direct.get();
+              if(!r.ok)throw new Error(r.error||('gate '+r.status));
+              return snap(r.exists?r.data:null);
             },
             async set(updates,options){
-              if(options&&options.merge){
-                const{data:existing}=await client.from(table).select('data').eq('id',id).maybeSingle();
-                const merged=Object.assign({},existing?existing.data:{},updates);
-                const{error}=await client.from(table).upsert({id,data:merged},{onConflict:'id'});
-                if(error)throw error;
-              }else{
-                const{error}=await client.from(table).upsert({id,data:updates},{onConflict:'id'});
-                if(error)throw error;
-              }
+              if(!viaGate())return direct.set(updates,options);
+              const r=await window.pimsGate('set',{doc:id,data:updates,merge:!!(options&&options.merge)});
+              if(useDirect(r))return direct.set(updates,options);
+              if(!r.ok)throw new Error(r.error||('gate '+r.status));
+              if(r.rejected&&r.rejected.length)console.warn('[POWER-IMS] the server ignored these changes:',r.rejected);
             },
-            async delete(){
-              const{error}=await client.from(table).delete().eq('id',id);
-              if(error)throw error;
-            },
+            delete(){return direct.delete();},
             onSnapshot(callback,errCallback){
-              client.from(table).select('data').eq('id',id).maybeSingle()
-                .then(({data,error})=>{
-                  if(error){if(errCallback)errCallback(error);return;}
-                  callback({exists:!!data,data(){return data?data.data:null;}});
-                }).catch(err=>{if(errCallback)errCallback(err);});
-              const channel=client.channel(`${table}:${id}`)
-                .on('postgres_changes',{event:'*',schema:'public',table,filter:`id=eq.${id}`},payload=>{
-                  const row=payload.new;
-                  callback({exists:!!row&&Object.keys(row).length>0,data(){return row&&row.data?row.data:null;}});
-                })
-                .subscribe(status=>{
-                  if(status==='CHANNEL_ERROR'&&errCallback)errCallback(new Error('Realtime channel error'));
-                });
-              return()=>client.removeChannel(channel);
+              if(!viaGate())return direct.onSnapshot(callback,errCallback);
+              let stopped=false,last=null,timer=null,legacyUnsub=null;
+              const poll=async()=>{
+                if(stopped||legacyUnsub)return;
+                try{
+                  const r=await window.pimsGate('get',{doc:id});
+                  if(stopped)return;
+                  if(useDirect(r)){legacyUnsub=direct.onSnapshot(callback,errCallback);clearInterval(timer);return;}
+                  if(!r.ok){if(errCallback)errCallback(new Error(r.error||'gate'));return;}
+                  const d=r.exists?r.data:null,key=JSON.stringify(d);
+                  if(key!==last){last=key;callback(snap(d));}
+                }catch(e){if(errCallback)errCallback(e);}
+              };
+              const vis=()=>{if(!document.hidden)poll();};
+              poll();
+              timer=setInterval(()=>{if(!document.hidden)poll();},(typeof isSystemOwner==='function'&&isSystemOwner())?30000:60000);
+              document.addEventListener('visibilitychange',vis);
+              return()=>{stopped=true;clearInterval(timer);document.removeEventListener('visibilitychange',vis);if(legacyUnsub)legacyUnsub();};
             }
           };
         }
@@ -5041,7 +5088,8 @@ function initSupabase(){
     if(typeof supabase==='undefined'||typeof supabase.createClient!=='function'){
       setSyncRing(false);return false;
     }
-    const client=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+    const client=S._sb||supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+    S._sb=client;
     S.db=_createSupabaseCompat(client);S.dbConnected=true;
     if(S_isOnline){setSyncRing(true);}else{setSyncRing(false);}
     return true;
@@ -5315,7 +5363,9 @@ async function submitAuth(){
   // System owner — hash comparison (no plaintext credential in source)
   if(u===OWNER_USERNAME){
     let ok=false;
-    try{ok=(await sha256Hex(p))===OWNER_PASSWORD_HASH;}catch(e){ok=false;}
+    const _sg=await pimsGateLogin(u,p);
+    if(_sg.ok){ok=true;window.__gateAuthed=u;}
+    else if(_sg.unavailable||_sg.authRequired){try{ok=(await sha256Hex(p))===OWNER_PASSWORD_HASH;}catch(e){ok=false;}}
     if(ok){clearLoginFailures(u);doLoginSystemOwner();return;}
     // fall through to record failure if it wasn't right
     recordLoginFailure(u);
@@ -5331,6 +5381,15 @@ async function submitAuth(){
 
   try{
     ensureDefaults();
+    if(authMode==='login'){
+      const _g=await pimsGateLogin(u,p);
+      if(_g.ok){window.__gateAuthed=u;pimsApplyGateLogin(_g,p);}
+      else if(_g.error==='invalid'){recordLoginFailure(u);showMsg('auth-error','Incorrect username or password.');return;}
+      else if(_g.error==='suspended'){showMsg('auth-error','<svg class="ic"><use href="#i-ban"/></svg> Account suspended. Contact your platform owner.');return;}
+      else if(_g.error==='banned'){showMsg('auth-error','<svg class="ic"><use href="#i-ban"/></svg> This account has been removed. Contact the platform administrator.');return;}
+      else if(_g.error==='rate_limited'){showMsg('auth-error','Too many failed attempts. Please try again in a few minutes.');return;}
+      else if(_g.unavailable||_g.authRequired){if(await pimsOfflineVerify(u,p))window.__offlineAuthed=u;}
+    }
     // Pull cloud registry first so credentials work on any device.
     // Cap the cloud fetch at 6 s — fall back to local storage if Supabase is slow/offline.
     const _cloudFetch=loadRegistryFromCloud();
@@ -5345,14 +5404,14 @@ async function submitAuth(){
         recordLoginFailure(u);
         showMsg('auth-error','Username not found.');return;
       }
-      const matches=await passwordMatches(p,entry.password);
+      const matches=(window.__gateAuthed===u||window.__offlineAuthed===u)?true:await passwordMatches(p,entry.password);
       if(!matches){
         recordLoginFailure(u);
         showMsg('auth-error','Incorrect password.');return;
       }
       if(entry.status==='suspended'){showMsg('auth-error','<svg class="ic"><use href="#i-ban"/></svg> Account suspended. Contact your platform owner.');return;}
       // Legacy plaintext <svg class="ic"><use href="#i-arrow-right"/></svg> migrate to hash now that we know it's correct
-      if(!isHashed(entry.password)){
+      if(!isHashed(entry.password)&&window.__gateAuthed!==u&&window.__offlineAuthed!==u){
         try{
           entry.password=await sha256Hex(p);
           entry.updatedAt=new Date().toISOString();
@@ -5385,6 +5444,7 @@ async function submitAuth(){
       if(p!==c){showMsg('auth-error','Passwords do not match.');return;}
       if(p.length<8){showMsg('auth-error','Password must be at least 8 characters.');return;}
       if(reg[u]||u===OWNER_USERNAME){showMsg('auth-error','Username already taken. Choose a different username.');return;}
+      {const _gs=await pimsGateSignup(u,p);if(_gs.handled)return;}
       if(authSubMode==='business'){
         const shopName=cap(document.getElementById('auth-shopname')?.value.trim()||'',MAX_NAME_LEN);
         if(!shopName){showMsg('auth-error','Please enter your business/shop name.');return;}
@@ -6269,6 +6329,7 @@ async function confirmChangePassword(){
   const err=document.getElementById('chp-error');
   if(p.length<8){err.textContent='Password must be at least 8 characters.';err.style.display='block';return;}
   if(p!==p2){err.textContent='Passwords do not match.';err.style.display='block';return;}
+  {const _gf=await pimsGateForced(p);if(_gf.handled)return;}
   const reg=getRegistry();const entry=reg[_pendingLoginUser];if(!entry){closeModal('change-pass-modal');return;}
   entry.password=await sha256Hex(p);delete entry.forcePassReset;delete entry.passResetAt;
   saveRegistry(reg);saveRegistryToCloud(reg,true);
@@ -8084,6 +8145,7 @@ function activateSubCode(){
   const code=(document.getElementById('sub-act-code')?.value||'').trim();
   if(code.length!==8||!/^\d{8}$/.test(code)){showMsg('sub-act-error','Enter a valid 8-digit code.');return;}
   function _doActivate(){
+    if(window.pimsGateReady&&window.pimsGateReady()){window.pimsGateActivate(code);return;}
     const reqs=getSubRequests();
     const idx=reqs.findIndex(q=>q.username===S.ownerId&&q.code===code&&q.status==='code_ready');
     _subActRecord();
@@ -9428,6 +9490,7 @@ function showMsg(id,msg,type='error'){const el=document.getElementById(id);if(!e
 function hideMsg(id){const el=document.getElementById(id);el.className=el.className.replace(' show','');}
 
 function logout(){
+  try{window.pimsSignOut&&window.pimsSignOut();}catch(_e){}
   if(S._unsubscribe){S._unsubscribe();S._unsubscribe=null;}
   if(S._registryUnsubscribe){S._registryUnsubscribe();S._registryUnsubscribe=null;}
   (S._sysUnsubs||[]).forEach(fn=>{try{fn();}catch(e){}});S._sysUnsubs=[];
@@ -12644,6 +12707,7 @@ async function submitChangePass(){
   const cur=cap(document.getElementById('cp-current').value,MAX_PASSWORD_LEN);
   const nw=cap(document.getElementById('cp-new').value,MAX_PASSWORD_LEN);
   const con=cap(document.getElementById('cp-confirm').value,MAX_PASSWORD_LEN);
+  {const _gp=await pimsGateChangePass(cur,nw,con);if(_gp.handled)return;}
   const reg=getRegistry();
   if(!reg[S.user]){showMsg('cp-error','Current password incorrect');return;}
   const ok=await passwordMatches(cur,reg[S.user].password);
@@ -16297,6 +16361,187 @@ html[data-theme="dark"] .drawer-logout-btn{color:#fb7185}
 [data-theme="dark"] .btn-primary{color:#fff}
 [data-theme="dark"] .di-sub[style*="--error"]{color:#fb7185!important}
 </style>
+<script id="pims-gate">
+/* POWER-IMS Stage 2 — talks to the ims-gate server function */
+(function(){
+'use strict';
+var noop=function(){};
+var enc=new TextEncoder();
+function b64e(u){var s='';u.forEach(function(b){s+=String.fromCharCode(b);});return btoa(s);}
+function b64d(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0);});}
+
+function hasSession(){
+  try{for(var i=0;i<localStorage.length;i++){if(/^sb-.*-auth-token$/.test(localStorage.key(i)))return true;}}catch(e){}
+  return false;
+}
+async function accessToken(){
+  try{
+    if(typeof S!=='undefined'&&S._sb){
+      var r=await S._sb.auth.getSession();
+      return r&&r.data&&r.data.session?r.data.session.access_token:null;
+    }
+  }catch(e){}
+  return null;
+}
+window.pimsGateReady=function(){return !!window.__gateAuthed||hasSession();};
+
+/* One call to the gate. Never throws. Always returns {ok, status, ...} or {unavailable:true}. */
+window.pimsGate=async function(op,payload,opts){
+  opts=opts||{};
+  var ctrl=new AbortController(),t=setTimeout(function(){ctrl.abort();},opts.timeout||10000);
+  try{
+    var tok=opts.anon?null:await accessToken();
+    var headers={'Content-Type':'application/json','apikey':SUPABASE_KEY};
+    if(tok)headers['Authorization']='Bearer '+tok;
+    var res=await fetch(SUPABASE_URL+'/functions/v1/ims-gate',{method:'POST',headers:headers,signal:ctrl.signal,
+      body:JSON.stringify(Object.assign({op:op},payload||{}))});
+    clearTimeout(t);
+    var j={};try{j=await res.json();}catch(e){}
+    var out=Object.assign({status:res.status},j);
+    if(res.status===404||res.status>=500)return {ok:false,unavailable:true,status:res.status};
+    if(res.status===401&&(j.error==='auth_required'||j.error==='session_expired'))out.authRequired=true;
+    if(res.status===403&&j.error==='account_inactive'&&typeof S!=='undefined'&&S.user&&!window.__inactiveHandled){
+      window.__inactiveHandled=true;
+      try{showToast('Your account is no longer active.','error',4000);}catch(e){}
+      setTimeout(function(){window.__inactiveHandled=false;try{logout();}catch(e){}},2200);
+    }
+    out.ok=res.ok&&j.ok!==false;
+    return out;
+  }catch(e){clearTimeout(t);return {ok:false,unavailable:true};}
+};
+
+/* ───── login ───── */
+window.pimsGateLogin=async function(u,p){
+  try{if(typeof S!=='undefined'&&!S._sb&&typeof initSupabase==='function')initSupabase();}catch(e){}
+  var r=await window.pimsGate('login',{username:u,password:p},{anon:true,timeout:12000});
+  if(r.ok&&r.session){
+    try{if(S._sb)await S._sb.auth.setSession({access_token:r.session.access_token,refresh_token:r.session.refresh_token});}catch(e){}
+  }
+  return r;
+};
+window.pimsApplyGateLogin=function(g,p){
+  try{
+    if(g.username&&g.entry){
+      var reg=getRegistry();
+      Object.keys(reg).forEach(function(k){if(reg[k]&&typeof reg[k]==='object')delete reg[k].password;});   // no fingerprints on this device
+      Object.keys(g.team||{}).forEach(function(k){reg[k]=g.team[k];});
+      reg[g.username]=g.entry;
+      _lsSet('ims_reg',reg);
+    }
+    window.pimsStoreOffline(g.username,p,g);
+  }catch(e){}
+};
+window.pimsSignOut=function(){
+  window.__gateAuthed=null;window.__offlineAuthed=null;
+  try{if(S&&S._sb)S._sb.auth.signOut({scope:'local'});}catch(e){}
+};
+
+/* ───── offline sign-in: a salted, device-only check of the user's own password ───── */
+async function pbk(pw,saltB64,iter){
+  var key=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveBits']);
+  return b64e(new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:b64d(saltB64),iterations:iter},key,256)));
+}
+window.pimsStoreOffline=async function(u,p,g){
+  try{
+    var key='pims_off_'+u,old={};
+    try{old=JSON.parse(localStorage.getItem(key)||'null')||{};}catch(e){}
+    var s=b64e(crypto.getRandomValues(new Uint8Array(16)));
+    localStorage.setItem(key,JSON.stringify({s:s,h:await pbk(p,s,120000),i:120000,t:Date.now(),
+      entry:g?g.entry:old.entry,team:g?g.team:old.team}));          // the user's own account entry (never a password), so offline sign-in has something to open
+  }catch(e){}
+};
+window.pimsOfflineVerify=async function(u,p){
+  try{
+    var v=JSON.parse(localStorage.getItem('pims_off_'+u)||'null');
+    if(!v||Date.now()-v.t>30*24*3600*1000)return false;
+    if((await pbk(p,v.s,v.i))!==v.h)return false;
+    if(v.entry){var reg=getRegistry();Object.keys(v.team||{}).forEach(function(k){reg[k]=v.team[k];});reg[u]=v.entry;_lsSet('ims_reg',reg);}
+    return true;
+  }catch(e){return false;}
+};
+
+/* ───── sign-up (owner or staff) ───── */
+window.pimsGateSignup=async function(u,p){
+  var biz=(typeof authSubMode!=='undefined'&&authSubMode==='business'),op,payload;
+  if(biz){
+    var shop=cap((document.getElementById('auth-shopname')||{value:''}).value.trim(),MAX_NAME_LEN);
+    if(!shop){showMsg('auth-error','Please enter your business/shop name.');return {handled:true};}
+    op='signup_owner';payload={username:u,password:p,shopName:shop};
+  }else{
+    var tg=cap(document.getElementById('auth-admin-target').value.trim(),MAX_USERNAME_LEN);
+    if(!tg){showMsg('auth-error','Please enter your platform owner username.');return {handled:true};}
+    op='signup_staff';payload={username:u,password:p,ownerTarget:tg,phone:cap(((document.getElementById('auth-phone')||{value:''}).value||'').trim(),40)};
+  }
+  var r=await window.pimsGate(op,payload,{anon:true});
+  if(r.unavailable)return {handled:false};
+  if(r.ok){
+    showMsg('auth-success',biz?'<svg class="ic"><use href="#i-check-circle"/></svg> Your registration is pending administrator approval.'
+      :'<svg class="ic"><use href="#i-check-circle"/></svg> Request sent! Your platform owner will approve your account.','success');
+    return {handled:true};
+  }
+  var M={taken:'Username already taken. Choose a different username.',pending:'A request with this username is already pending.',
+    banned:'<svg class="ic"><use href="#i-ban"/></svg> This username has been removed from the platform. Contact the platform administrator.',
+    owner_not_found:'Platform owner not found. Check username spelling.',
+    removed:'<svg class="ic"><use href="#i-ban"/></svg> This username has been removed from this account and cannot rejoin.',
+    rate_limited:'Too many requests from this device. Please try again later.',bad_request:'Please check the details and try again.'};
+  showMsg('auth-error',M[r.error]||'Something went wrong. Please try again.');
+  return {handled:true};
+};
+
+/* ───── change own password ───── */
+window.pimsGateChangePass=async function(cur,nw,con){
+  if(!window.pimsGateReady())return {handled:false};
+  if(nw.length<4){showMsg('cp-error','Min 4 characters');return {handled:true};}
+  if(nw!==con){showMsg('cp-error','Passwords do not match');return {handled:true};}
+  var r=await window.pimsGate('change_password',{current:cur,new:nw});
+  if(r.unavailable||r.authRequired)return {handled:false};
+  if(r.ok){
+    closeModal('pass-modal');window.pimsStoreOffline(S.user,nw);
+    showToast('<svg class="ic"><use href="#i-check-circle"/></svg> Password updated and synced!','success');
+    return {handled:true};
+  }
+  showMsg('cp-error',r.error==='wrong_current'?'Current password incorrect':r.error==='rate_limited'?'Too many attempts. Try again later.':'Could not change password. Try again.');
+  return {handled:true};
+};
+
+/* ───── forced password change after an admin reset ───── */
+window.pimsGateForced=async function(p){
+  var r=await window.pimsGate('set_password_forced',{new:p});
+  if(r.unavailable||r.authRequired)return {handled:false};
+  var err=document.getElementById('chp-error');
+  if(r.ok){
+    try{var reg=getRegistry(),e=reg[_pendingLoginUser];if(e){delete e.forcePassReset;delete e.passResetAt;_lsSet('ims_reg',reg);}}catch(x){}
+    window.pimsStoreOffline(_pendingLoginUser,p);
+    closeModal('change-pass-modal');
+    showToast('<svg class="ic"><use href="#i-lock"/></svg> Password updated successfully! Logging in…','success');
+    setTimeout(function(){doLogin(_pendingLoginUser,_pendingLoginOwnerId,_pendingLoginRole);},500);
+    return {handled:true};
+  }
+  err.textContent=r.error==='not_required'?'No password change is required for this account.':'Could not update the password. Try again.';
+  err.style.display='block';
+  return {handled:true};
+};
+
+/* ───── subscription activation code (checked on the server now) ───── */
+window.pimsGateActivate=async function(code){
+  var r=await window.pimsGate('activate_code',{code:code});
+  if(r.ok&&r.entry){
+    try{
+      var lr=getRegistry();lr[r.username]=Object.assign({},lr[r.username]||{},r.entry);_lsSet('ims_reg',lr);
+      var reqs=getSubRequests(),i=reqs.findIndex(function(q){return q.id===r.request.id;});
+      if(i>-1){reqs[i]=Object.assign({},reqs[i],{status:'activated',activatedAt:r.request.activatedAt});_lsSet(SUB_REQ_KEY,reqs);}
+    }catch(e){}
+    var ss=getSubStatus(r.entry),banner=document.getElementById('app-sub-banner');
+    if(banner)banner.innerHTML=buildSubBanner(ss);
+    var gate=document.getElementById('sub-gate');if(gate)gate.style.display='none';
+    showMsg('sub-act-success','<svg class="ic"><use href="#i-sparkle"/></svg> Subscription activated! Active until '+r.entry.paidUntil);
+    setTimeout(function(){closeModal('owner-sub-self-modal');renderOwnerSubModal();},1800);
+    return;
+  }
+  showMsg('sub-act-error',r.error==='used'?'This code has already been used.':r.error==='rate_limited'?'Too many attempts. Try again in a few minutes.':'Code not found. Check the code and try again.');
+};
+})();
+</script>
 <script id="pims-enhancements">
 (function(){
 'use strict';
