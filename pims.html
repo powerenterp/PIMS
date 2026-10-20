@@ -16360,6 +16360,25 @@ html[data-theme="dark"] .drawer-logout-btn{color:#fb7185}
 .td-badge.badge-other,.badge-other{color:var(--p-text)}
 [data-theme="dark"] .btn-primary{color:#fff}
 [data-theme="dark"] .di-sub[style*="--error"]{color:#fb7185!important}
+
+/* ── Phone polish (batch 1) ───────────────────────────────────────── */
+/* empty cells in the totals bar no longer show up as blank tiles on phones */
+html[data-card="1"] .summary-row td:empty{display:none!important}
+/* toolbars that were a single non-wrapping row (e.g. Credit: Export PDF / Download Excel) now wrap instead of running off screen */
+#tab-content div[style*="display:flex"][style*="margin-left:auto"]{flex-wrap:wrap;justify-content:flex-end}
+/* period chips: one swipeable row, bigger touch targets */
+html[data-view="mobile"] .dr-chips{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-right:28px;scroll-padding:0 28px}
+html[data-view="mobile"] .dr-chips::-webkit-scrollbar{display:none}
+html[data-view="mobile"] .dr-chip{flex:0 0 auto;min-height:36px;padding:0 14px;display:inline-flex;align-items:center;white-space:nowrap}
+
+/* ── Batch 1b: tables on desktop ──────────────────────────────────── */
+html[data-view="desktop"] .table-wrap{max-height:calc(100vh - 240px);overflow:auto}
+html[data-view="desktop"] .table-wrap thead th{position:sticky;top:0;z-index:3;background:var(--surface2,#fff)}
+/* a column with nothing in it (e.g. Image when no item has a photo) is hidden */
+[data-pims-hide]{display:none!important}
+
+/* the floating + button no longer sits on top of the grand total on phones */
+html[data-card="1"] #tab-content .summary-row{padding-right:78px!important;box-sizing:border-box}
 </style>
 <script id="pims-gate">
 /* POWER-IMS Stage 2 — talks to the ims-gate server function */
@@ -16782,6 +16801,42 @@ function scan(){
   });
   // 4d. form error messages are announced to screen readers
   [].forEach.call(root.querySelectorAll('.modal-error:not([role])'),function(el){el.setAttribute('role','alert');});
+  // 4e. number-like text fields open a number keypad on phones
+  [].forEach.call(root.querySelectorAll('input:not([inputmode]):not([data-kb])'),function(el){
+    el.setAttribute('data-kb','1');
+    var t=(el.type||'text').toLowerCase();if(t!=='text'&&t!=='')return;
+    var k=((el.id||'')+' '+(el.name||'')).toLowerCase();
+    if(/phone|tel\b|mobile/.test(k))el.setAttribute('inputmode','tel');
+    else if(/qty|quantity|price|amount|rate|cash|balance|commission|vat|tax|total|cost/.test(k))el.setAttribute('inputmode','decimal');
+  });
+  // 4f. keep the selected period chip in view when the chip row scrolls sideways
+  [].forEach.call(root.querySelectorAll('.dr-chips'),function(c){
+    if(c._pimsScrolled)return;c._pimsScrolled=true;
+    var a=c.querySelector('.dr-active');
+    if(a&&c.scrollWidth>c.clientWidth)c.scrollLeft=Math.max(0,a.getBoundingClientRect().left-c.getBoundingClientRect().left+c.scrollLeft-24);
+  });
+  // 4g. short dates on the phone cards ("19 Oct" instead of "2026-10-19")
+  [].forEach.call(root.querySelectorAll('.ux-main .r1:not([data-iso])'),function(el){
+    var m=(el.textContent||'').match(/^(\d{4})-(\d{2})-(\d{2})(.*)$/);
+    if(!m)return;
+    el.setAttribute('data-iso',m[1]+'-'+m[2]+'-'+m[3]);
+    try{
+      var d=new Date(Date.UTC(+m[1],+m[2]-1,+m[3])),y=new Date().getUTCFullYear();
+      var f=new Intl.DateTimeFormat((typeof S!=='undefined'&&S.lang==='am')?'am':'en-GB',{day:'numeric',month:'short',year:(+m[1]!==y)?'numeric':undefined,timeZone:'UTC'}).format(d);
+      el.textContent=f+m[4];
+    }catch(e){}
+  });
+  // 4h. hide a table column that is empty everywhere (the Image column when no item has a photo) — never on the Items tab, where it is how photos are added
+  [].forEach.call(root.querySelectorAll('#tab-content table'),function(t){
+    var thumbs=t.querySelectorAll('tbody td .item-thumb'),hide=false;
+    if(thumbs.length&&typeof S!=='undefined'&&S.tab!=='ITEMS')hide=![].some.call(thumbs,function(x){return x.querySelector('img');});
+    var firstRow=t.querySelector('tbody tr.ux-rec')||t.querySelector('tbody tr');
+    var heads=t.querySelectorAll('thead th'),imgTd=firstRow&&firstRow.querySelector('td .item-thumb');
+    if(!firstRow||!heads.length||!imgTd)return;
+    var td=imgTd.closest('td'),i=[].indexOf.call(firstRow.children,td)-(firstRow.querySelector(':scope > td.ux-sum')?1:0);
+    [].forEach.call(t.querySelectorAll('tbody tr'),function(r){var c=r.children[i+(r.querySelector(':scope > td.ux-sum')?1:0)];if(c&&c.querySelector('.item-thumb')){if(hide)c.setAttribute('data-pims-hide','1');else c.removeAttribute('data-pims-hide');}});
+    if(heads[i]){if(hide)heads[i].setAttribute('data-pims-hide','1');else heads[i].removeAttribute('data-pims-hide');}
+  });
   // skip link only makes sense while the app is on screen
   var skip=document.getElementById('skip-to-content'),tc=document.getElementById('tab-content');
   if(tc){
@@ -16805,6 +16860,24 @@ function scheduleScan(){
 }
 new MutationObserver(scheduleScan).observe(document.body,{childList:true,subtree:true});
 scheduleScan();
+
+/* Swipe a record card to the left → the app's own Edit / Delete / Receipt menu (long-press already did this) */
+(function(){
+  var row=null,sx=0,sy=0,t0=0;
+  document.addEventListener('touchstart',function(e){
+    var r=e.target.closest&&e.target.closest('tr.ux-rec');
+    if(!r||e.touches.length!==1||document.documentElement.getAttribute('data-view')!=='mobile'){row=null;return;}
+    row=r;sx=e.touches[0].clientX;sy=e.touches[0].clientY;t0=Date.now();
+  },{passive:true});
+  document.addEventListener('touchend',function(e){
+    if(!row)return;var r=row;row=null;
+    var t=e.changedTouches[0],dx=t.clientX-sx,dy=t.clientY-sy;
+    if(dx<-70&&Math.abs(dy)<35&&Date.now()-t0<700){
+      var m=(r.getAttribute('oncontextmenu')||'').match(/showCtxMenu\(event,(\d+),'(\w+)'\)/);
+      if(m&&typeof showCtxMenu==='function')showCtxMenu({preventDefault:function(){},clientX:t.clientX,clientY:t.clientY},+m[1],m[2]);
+    }
+  },{passive:true});
+})();
 
 /* Logo images that were already broken before the fallback was attached */
 [].forEach.call(document.querySelectorAll('img'),function(i){
